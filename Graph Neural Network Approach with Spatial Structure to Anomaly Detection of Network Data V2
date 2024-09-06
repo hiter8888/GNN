@@ -1,0 +1,613 @@
+
+import pandas as pd
+import networkx as nx
+import dgl
+import torch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import dgl.function as fn
+from dgl.nn.pytorch import GATConv
+from dgl.nn.pytorch import edge_softmax
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score,matthews_corrcoef
+import geoopt
+import numpy as np
+from sklearn.metrics import mutual_info_score
+from sklearn.preprocessing import KBinsDiscretizer
+from sklearn.impute import SimpleImputer
+import ipaddress
+
+def corrupt_graph(graph):
+    corrupted_graph = graph.clone()  
+    if 'h' in graph.ndata:
+        node_features = graph.ndata['h']
+        node_idx = torch.randperm(node_features.shape[0])
+        corrupted_graph.ndata['h'] = node_features[node_idx]
+    else:
+        print("Graph does not contain node feature 'h'. Skipping node feature corruption.")
+
+    if 'e' in graph.edata:
+        edge_features = graph.edata['e']
+        edge_idx = torch.randperm(edge_features.shape[0])
+        corrupted_graph.edata['e'] = edge_features[edge_idx]
+    else:
+        print("Graph does not contain edge feature 'e'. Skipping edge feature corruption.")
+
+    return corrupted_graph
+
+def reshape_if_necessary(array):
+    if array.ndim == 1:
+        return array.reshape(-1, 1)
+    return array
+
+def compute_mutualinfo(graph1, graph2, n_bins=10):
+    node_features1 = graph1.ndata['feat']
+    node_features2 = graph2.ndata['feat']
+    node_features1 = node_features1.numpy()
+    node_features2 = node_features2.numpy()
+    num_nodes1 = node_features1.shape[0]
+    num_nodes2 = node_features2.shape[0]
+    num_nodes = min(num_nodes1, num_nodes2)
+    node_features1 = node_features1[:num_nodes]
+    node_features2 = node_features2[:num_nodes]
+    
+    imputer = SimpleImputer(strategy='mean')
+    node_features1 = imputer.fit_transform(reshape_if_necessary(node_features1))
+    node_features2 = imputer.fit_transform(reshape_if_necessary(node_features2))
+    
+    discretizer = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='uniform', subsample=None)
+    node_features1 = discretizer.fit_transform(node_features1)
+    node_features2 = discretizer.fit_transform(node_features2)
+    
+    node_mutual_info = []
+    for i in range(node_features1.shape[1]):
+        mi = mutual_info_score(node_features1[:, i], node_features2[:, i])
+        node_mutual_info.append(mi)
+
+    edge_features1 = graph1.edata['src_port']
+    edge_features2 = graph2.edata['dst_port']
+
+
+    edge_features1 = edge_features1.numpy()
+    edge_features2 = edge_features2.numpy()
+    
+
+    num_edges1 = edge_features1.shape[0]
+    num_edges2 = edge_features2.shape[0]
+    
+
+    num_edges = min(num_edges1, num_edges2)
+    
+
+    edge_features1 = edge_features1[:num_edges]
+    edge_features2 = edge_features2[:num_edges]
+    
+
+    edge_features1 = imputer.fit_transform(reshape_if_necessary(edge_features1))
+    edge_features2 = imputer.fit_transform(reshape_if_necessary(edge_features2))
+    
+    edge_features1 = discretizer.fit_transform(edge_features1)
+    edge_features2 = discretizer.fit_transform(edge_features2)
+    
+    edge_mutual_info = []
+    for i in range(edge_features1.shape[1]):
+        mi = mutual_info_score(edge_features1[:, i], edge_features2[:, i])
+        edge_mutual_info.append(mi)
+    
+    avg_node_mutual_info = np.mean(node_mutual_info)
+    avg_edge_mutual_info = np.mean(edge_mutual_info)
+    
+    return (avg_node_mutual_info + avg_edge_mutual_info) / 2
+
+def augment_train_graph(train_graphs, train_labels):
+    augmented_graphs = []
+    augmented_labels = []
+
+    for graph, label in zip(train_graphs, train_labels):
+        augmented_graphs.append(graph)
+        augmented_labels.append(label)
+        
+        corrupted_graph = corrupt_graph(graph)
+        mutualinfovalue = compute_mutualinfo(graph,corrupted_graph)
+        if mutualinfovalue > 0.22:
+
+            augmented_graphs.append(corrupted_graph)
+            augmented_labels.append(label)
+        
+        if mutualinfovalue < 0.15:
+            augmented_graphs.append(corrupted_graph)
+            if label == 0:
+                label=1
+            else:
+                label=0
+            augmented_labels.append(label)
+    return augmented_graphs, augmented_labels
+
+
+file_path = 'test_for_graph_create.csv'
+network_data = pd.read_csv(file_path)
+
+def convert_to_int(value):
+    if isinstance(value, str):
+        return int(value.replace(',', ''))
+    return int(value)
+
+num_cols = ['L4_SRC_PORT', 'L4_DST_PORT', 'IN_BYTES', 'IN_PKTS']
+for col in num_cols:
+    network_data[col] = network_data[col].apply(convert_to_int)
+
+
+def parse_timestamp(ts):
+    ts = ts.replace("st", "").replace("nd", "").replace("rd", "").replace("th", "")
+    dt = pd.to_datetime(ts, format='%B %d %Y, %H:%M:%S.%f')
+    return dt.strftime('%H:%M:%S.%f')  
+
+network_data['Time'] = network_data['Timestamp'].apply(parse_timestamp)
+
+network_data['Timestamp'] = pd.to_datetime(network_data['Timestamp'].apply(lambda ts: ts.replace("st", "").replace("nd", "").replace("rd", "").replace("th", "")), format='%B %d %Y, %H:%M:%S.%f')
+network_data['Time Bin'] = network_data['Timestamp'].dt.floor('T')
+
+
+
+def ip_to_vector(ip):
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            expanded_ip = ip_obj.exploded
+            vector = [int(part, 16) for part in expanded_ip.split(':')]
+            return torch.tensor(vector, dtype=torch.float32)
+        else:
+            raise ValueError("IP address is not IPv6")
+    except ValueError as e:
+        return None    # Convert an IPv6 address to a vector of integers
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            # IPv6 address
+            return [int(part, 16) for part in ip.split(':')]
+        else:
+            # If it somehow isn't an IPv6, raise an error
+            raise ValueError("IP address is not IPv6")
+    except ValueError as e:
+        #print(f"Error converting IP to vector: {e}")
+        return None
+
+
+
+
+def hyperbolic_distance(u, v, W, b):
+    transformed_u = np.dot(W, u) + b
+    transformed_v = np.dot(W, v) + b
+    difference = np.linalg.norm(transformed_u - transformed_v)
+    exp_term = np.exp(-difference)
+    distance = 1 / (1 + exp_term)
+    norm_u = np.linalg.norm(u)
+    norm_v = np.linalg.norm(v)
+    cosh_term = np.arccosh(1 + 2 * difference**2 / ((1 - norm_u**2) * (1 - norm_v**2)))
+    return distance * cosh_term
+
+def compute_loss(u, v, W, b, target_distance):
+    distance = hyperbolic_distance(u, v, W, b)
+    loss = (distance - target_distance) ** 2
+    return loss
+
+def compute_gradients(u, v, W, b, target_distance, epsilon=1e-6):
+    grad_W = np.zeros_like(W)
+    grad_b = np.zeros_like(b)
+    
+    # Calculate gradient for W
+    for i in range(W.shape[0]):
+        for j in range(W.shape[1]):
+            W_perturb = np.copy(W)
+            W_perturb[i, j] += epsilon
+            loss_plus = compute_loss(u, v, W_perturb, b, target_distance)
+            loss_minus = compute_loss(u, v, W, b, target_distance)
+            grad_W[i, j] = (loss_plus - loss_minus) / epsilon
+    
+    # Calculate gradient for b
+    for i in range(b.shape[0]):
+        b_perturb = np.copy(b)
+        b_perturb[i] += epsilon
+        loss_plus = compute_loss(u, v, W, b_perturb, target_distance)
+        loss_minus = compute_loss(u, v, W, b, target_distance)
+        grad_b[i] = (loss_plus - loss_minus) / epsilon
+    
+    return grad_W, grad_b
+
+def train_hyperbolic_model(embeddings, target_distances, num_epochs=10, learning_rate=0.01):
+    embeddings = np.array(list(embeddings.values()))  # Convert dict to numpy array
+    target_distances = np.array(target_distances)  # Ensure target_distances is numpy array
+    
+    num_nodes, dim = embeddings.shape
+    W = np.random.randn(dim, dim)
+    b = np.random.randn(dim)
+    
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                u = embeddings[i]
+                v = embeddings[j]
+                target_distance = target_distances[i, j]
+                
+                loss = compute_loss(u, v, W, b, target_distance)
+                total_loss += loss
+                
+                # Compute gradients and update parameters
+                grad_W, grad_b = compute_gradients(u, v, W, b, target_distance)
+                W -= learning_rate * grad_W
+                b -= learning_rate * grad_b
+        
+        print(f"Epoch {epoch + 1}, Total Loss: {total_loss}")
+
+    return W, b
+
+def calculate_distance(u, v, W, b):
+    
+    return hyperbolic_distance(u, v, W, b)
+
+
+def compute_target_distances(embeddings, poincare_ball):
+    nodes = list(embeddings.keys())
+    num_nodes = len(nodes)
+    target_distances = np.zeros((num_nodes, num_nodes))
+    
+    for i in range(num_nodes):
+        for j in range(i + 1, num_nodes):
+            u = nodes[i]
+            v = nodes[j]
+            dist = poincare_ball.dist(embeddings[u], embeddings[v])
+            target_distances[i, j] = dist
+            target_distances[j, i] = dist  # Distance matrix is symmetric
+    
+    return target_distances
+
+def optimize_edge_weights(graph, embedding_dim=16):
+    node_embeddings = {}
+    for node in graph.nodes:
+        ip_vector = ip_to_vector(node)
+        node_embeddings[node] = ip_vector
+    poincare_ball = geoopt.PoincareBall(c=1.0)
+    hyperbolic_embeddings = {node: poincare_ball.expmap0(emb) for node, emb in node_embeddings.items()}
+
+
+
+    for u, v, d in graph.edges(data=True):
+        dist = poincare_ball.dist(hyperbolic_embeddings[u], hyperbolic_embeddings[v])
+
+        embeddings = hyperbolic_embeddings
+        target_distances = compute_target_distances(hyperbolic_embeddings, poincare_ball)
+        W, b = train_hyperbolic_model(embeddings, target_distances, num_epochs=10, learning_rate=0.01)
+        u = hyperbolic_embeddings[u]
+        v = hyperbolic_embeddings[v]
+        distance = calculate_distance(u, v, W, b)
+        d['weight'] = 1 / distance
+    
+    return graph
+
+# Create a function to generate a graph for each time bin
+def create_graph(data):
+    G = nx.DiGraph()
+    for _, row in data.iterrows():
+        src = row['IPV6_SRC_ADDR']
+        dst = row['IPV6_DST_ADDR']
+        src_port = row['L4_SRC_PORT']
+        dst_port = row['L4_DST_PORT']
+        protocol = row['PROTOCOL']
+        flow_duration = row['IN_BYTES']
+        inpackage = row['IN_PKTS']
+        
+        if not G.has_node(src):
+            G.add_node(src)
+        if not G.has_node(dst):
+            G.add_node(dst)
+        
+        G.add_edge(src, dst, 
+                   src_port=src_port, 
+                   dst_port=dst_port, 
+                   protocol=protocol,
+                   flow_duration=flow_duration,
+                   inpackage = inpackage,
+                   weight=1)  # You can add more edge attributes if needed
+    return G
+
+
+# Create graphs for each time bin
+time_bins = network_data['Time Bin'].unique()
+graphs = []
+for time_bin in time_bins:
+    data_bin = network_data[network_data['Time Bin'] == time_bin]
+    G = create_graph(data_bin)
+    G = optimize_edge_weights(G)
+    graphs.append(G)
+dgl_graphs = [dgl.from_networkx(g, edge_attrs=['src_port', 'dst_port', 'protocol', 'flow_duration', 'inpackage','weight']) for g in graphs]
+
+
+for g in dgl_graphs:
+   
+    degrees = torch.tensor([d for d in g.in_degrees().numpy()], dtype=torch.float32).view(-1, 1)
+    g.ndata['feat'] = degrees  # or any other node features
+
+sample_graph = dgl_graphs[0]
+sample_graph.ndata, sample_graph.edata
+
+#Model Definition: Define a simple GCN model using DGL.
+#Data Preparation: Prepare your data and labels for training.
+#Training: Set up the training loop to optimize the model.
+#Evaluation: Evaluate the model on test data to measure performance.
+
+#Define the GNN Model
+
+class CustomGATConv(nn.Module):
+    def __init__(self, in_feats, out_feats, num_heads):
+        super(CustomGATConv, self).__init__()
+        self.num_heads = num_heads
+        self.in_feats = in_feats
+        self.out_feats = out_feats
+        self.fc = nn.Linear(in_feats, out_feats * num_heads, bias=False)
+        self.attn_l = nn.Parameter(torch.Tensor(size=(1, num_heads, out_feats)))
+        self.attn_r = nn.Parameter(torch.Tensor(size=(1, num_heads, out_feats)))
+        self.attn_edge = nn.Parameter(torch.Tensor(size=(1, num_heads, out_feats)))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.xavier_uniform_(self.attn_l)
+        nn.init.xavier_uniform_(self.attn_r)
+        nn.init.xavier_uniform_(self.attn_edge)
+
+    def edge_attention(self, edges):
+        # Ensure all tensors have compatible shapes
+        el = edges.src['el']  # Shape: (num_edges, num_heads, 1)
+        er = edges.dst['er']  # Shape: (num_edges, num_heads, 1)
+        ef = edges.data['ef']  # Shape: (num_edges, num_heads)
+        
+     
+        ef = ef.unsqueeze(-1)  # Change shape to (num_edges, num_heads, 1)
+
+        # Compute attention scores using edge features
+        a = el + er + ef
+        #print("to here is ok?")
+       
+        return {'e': F.leaky_relu(a)}
+
+    def message_func(self, edges):
+        return {'z': edges.src['z'], 'e': edges.data['e']}
+
+    def reduce_func(self, nodes):
+       
+        alpha = F.softmax(nodes.mailbox['e'], dim=1)  
+       
+        h = torch.sum(alpha * nodes.mailbox['z'], dim=1) 
+        return {'h': h}
+
+
+
+    def forward(self, graph, h, edge_feat):
+        # Apply linear transformation to node features
+        z = self.fc(h).view(-1, self.num_heads, self.out_feats)
+        graph.ndata['z'] = z
+        graph.ndata['el'] = (z * self.attn_l).sum(dim=-1).unsqueeze(-1)
+        graph.ndata['er'] = (z * self.attn_r).sum(dim=-1).unsqueeze(-1)
+
+        # Ensure edge_feat has correct dimensions
+        if edge_feat.dim() == 2:  # Only unsqueeze if edge_feat has 2 dimensions
+            edge_feat = edge_feat.unsqueeze(1)  # Change shape to (num_edges, 1, edge_feat_dim)
+     
+            
+        if edge_feat.shape[1] != self.num_heads:  # Only repeat if the num_heads dimension is not correct
+            edge_feat = edge_feat.repeat(1, self.num_heads, 1)  # Change shape to (num_edges, num_heads, out_feats)
+              
+        ef = (edge_feat * self.attn_edge).sum(dim=-1)
+        
+
+     
+            
+        # Assign edge features
+        graph.edata['ef'] = ef
+
+        # Apply edge attention
+        graph.apply_edges(self.edge_attention)
+        
+        # Message passing
+        graph.update_all(self.message_func, self.reduce_func)
+        
+        return graph.ndata.pop('h')
+    
+#class GAT(nn.Module):
+class EdgeGAT(nn.Module):
+    def __init__(self, in_feats, hidden_feats, out_feats, num_heads):
+        super(EdgeGAT, self).__init__()
+        self.layer1 = CustomGATConv(in_feats, hidden_feats, num_heads)
+        self.layer2 = CustomGATConv(hidden_feats * num_heads, out_feats, 1)
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(6, hidden_feats), #Number of attributes defined here: dgl_graphs = [dgl.from_networkx(g, edge_attrs=['src_port', 'dst_port', 'protocol', 'flow_duration', 'inpackage','weight']) for g in graphs]
+            nn.ReLU(),
+            nn.Linear(hidden_feats, hidden_feats)
+        )
+
+    def forward(self, graph):
+        h = graph.ndata['h']
+        edge_features = torch.cat([
+            graph.edata['src_port'].unsqueeze(1).float(),
+            graph.edata['dst_port'].unsqueeze(1).float(),
+            graph.edata['protocol'].unsqueeze(1).float(),
+            graph.edata['flow_duration'].unsqueeze(1).float(),
+            graph.edata['inpackage'].unsqueeze(1).float(),
+            graph.edata['weight'].unsqueeze(1).float()
+        ], dim=1)
+        
+        graph.edata['e'] = self.edge_mlp(edge_features)
+        
+        
+        h = self.layer1(graph, h, graph.edata['e'])
+        h = h.flatten(1)  
+       
+        graph.ndata['h'] = h
+        
+     
+        
+        
+
+      
+       
+        h = self.layer2(graph, graph.ndata['h'], graph.edata['e'])
+        
+        
+
+        h = h.mean(1)  # Average over the heads
+        
+
+        
+        return h
+
+        
+    #Prepare the Data for Training
+# Example function to create labels (this should be based on your specific dataset)
+# Convert the Timestamp to datetime
+network_data = pd.read_csv(file_path)
+
+network_data['Time'] = network_data['Timestamp'].apply(parse_timestamp)
+
+
+network_data['Timestamp'] = pd.to_datetime(network_data['Timestamp'].apply(lambda ts: ts.replace("st", "").replace("nd", "").replace("rd", "").replace("th", "")), format='%B %d %Y, %H:%M:%S.%f')
+
+
+# Define the time bins (e.g., 1-minute intervals)
+network_data['Time Bin'] = network_data['Timestamp'].dt.floor('T')
+####replance from here to match new context
+# Function to determine if a time bin is anomalous
+def is_anomalous(group):
+    labels = group['Label']
+    if all(labels == 0):
+        return 0  # Normal
+    else:
+        return 1  # Anomalous
+
+# Apply the function to each time bin
+time_bins = network_data.groupby('Time Bin').apply(is_anomalous).reset_index()
+time_bins.columns = ['Time Bin', 'Anomaly']
+
+# Extract labels for each time bin
+labels = time_bins['Anomaly'].tolist()
+
+
+
+# Example parameters
+num_feats = 10  # Number of input features per node
+hidden_feats = 16  # Number of hidden units in GATConv layers
+out_feats = 2  # Number of output features per node
+num_heads = 8  # Number of attention heads in GATConv layers
+
+# Initialize the model
+model = EdgeGAT(in_feats=num_feats, hidden_feats=hidden_feats, out_feats=out_feats, num_heads=num_heads)
+
+
+# Perform a forward pass for each graph in dgl_graphs
+for graph in dgl_graphs:
+    if 'h' not in graph.ndata:
+        graph.ndata['h'] = torch.randn(graph.num_nodes(), num_feats)
+    
+    outputs = model(graph)
+    
+# Define the loss function and optimizer
+loss_fn = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Split the data into training and test sets
+# For simplicity, we'll assume an 80/20 split
+split_idx = int(len(dgl_graphs) * 0.8)
+train_graphs = dgl_graphs[:split_idx]
+train_labels = labels[:split_idx]
+#augment data using DGI
+augmented_graphs, augmented_labels = augment_train_graph(train_graphs, train_labels)
+train_graphs = augmented_graphs
+train_labels = augmented_labels
+
+
+test_graphs = dgl_graphs[split_idx:]
+test_labels = labels[split_idx:]
+# Define the number of epochs
+num_epochs = 50
+
+# Training loop
+for epoch in range(num_epochs):
+    model.train()  # Set the model to training mode
+    total_loss = 0
+
+    for i, graph in enumerate(train_graphs):
+        if 'h' not in graph.ndata:
+            graph.ndata['h'] = torch.randn(graph.num_nodes(), num_feats)
+
+            # Set example edge features for the graph
+            graph.edata['src_port'] = torch.randint(0, 65535, (graph.num_edges(),))
+            graph.edata['dst_port'] = torch.randint(0, 65535, (graph.num_edges(),))
+            graph.edata['protocol'] = torch.randint(0, 255, (graph.num_edges(),))
+            graph.edata['flow_duration'] = torch.rand(graph.num_edges())
+            graph.edata['inpackage'] = torch.rand(graph.num_edges())
+            graph.edata['weight'] = torch.rand(graph.num_edges())
+
+        # Forward pass
+        outputs = model(graph)
+     
+        # Aggregate node-level outputs to graph-level by taking the mean of node features
+        graph_rep = outputs.mean(dim=0, keepdim=True)  # Shape: (1, num_classes)
+
+        # Assume train_labels[i] is the label for the current graph
+        label = torch.tensor([train_labels[i]], dtype=torch.long)
+
+        # Compute loss
+        loss = loss_fn(graph_rep, label)  # Ensure graph_rep is (1, num_classes) for loss computation
+
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_graphs)
+    print(f'Epoch {epoch + 1}/{num_epochs}, Loss: {avg_loss:.4f}')
+
+    # Evaluation loop
+model.eval()
+all_preds = []
+all_labels = []
+
+with torch.no_grad():
+    for i, graph in enumerate(test_graphs):
+        if 'h' not in graph.ndata:
+            graph.ndata['h'] = torch.randn(graph.num_nodes(), num_feats)
+
+            # Set example edge features for the graph
+            graph.edata['src_port'] = torch.randint(0, 65535, (graph.num_edges(),))
+            graph.edata['dst_port'] = torch.randint(0, 65535, (graph.num_edges(),))
+            graph.edata['protocol'] = torch.randint(0, 255, (graph.num_edges(),))
+            graph.edata['flow_duration'] = torch.rand(graph.num_edges())
+            graph.edata['inpackage'] = torch.rand(graph.num_edges())
+            graph.edata['weight'] = torch.rand(graph.num_edges())
+
+        # Forward pass
+        outputs = model(graph)
+        
+        # Aggregate node-level outputs to graph-level by taking the mean of node features
+        graph_rep = outputs.mean(dim=0, keepdim=True)  # Shape: (1, num_classes)
+        preds = torch.argmax(graph_rep, dim=1).cpu().numpy()
+
+        all_preds.extend(preds)
+        all_labels.extend([test_labels[i]])
+
+accuracy = accuracy_score(all_labels, all_preds)
+precision = precision_score(all_labels, all_preds)
+recall = recall_score(all_labels, all_preds)
+f1 = f1_score(all_labels, all_preds)
+mcc = matthews_corrcoef(all_labels, all_preds)
+
+print(f'Accuracy: {accuracy:.4f}')
+print(f'Precision: {precision:.4f}')
+print(f'Recall: {recall:.4f}')
+print(f'F1 Score: {f1:.4f}')
+print(f'Matthew’s Correlation Coefficient: {mcc:.4f}')
